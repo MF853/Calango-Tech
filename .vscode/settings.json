@@ -1,0 +1,8 @@
+{
+  "workbench.statusBar.visible": true,
+  "workbench.activityBar.visible": true,
+  "workbench.sideBar.visible": true,
+  "workbench.editor.showTabs": true,
+  "breadcrumbs.enabled": true,
+  "editor.minimap.enabled": true
+}

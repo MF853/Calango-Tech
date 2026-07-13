@@ -89,8 +89,9 @@
 // ============================================================
 //  CONFIGURAÇÃO WI-FI — preencha antes de compilar!
 // ============================================================
-const char* WIFI_SSID     = "MarioS23";      // Nome da rede Wi-Fi
-const char* WIFI_PASSWORD = "12345678";     // Senha da rede Wi-Fi
+const char* WIFI_SSID     = "Mario";      // Nome da rede Wi-Fi
+const char* WIFI_PASSWORD = "JMSFMMOLS";     // Senha da rede Wi-Fi
+const char* FIRMWARE_VERSION = "2026.07.10-3";
 
 // ── Pinos Motor A (Esquerdo) ──────────────────────────────────
 // ENA → ligado diretamente ao 5 V na fiação (velocidade máxima fixa)
@@ -105,6 +106,9 @@ const char* WIFI_PASSWORD = "12345678";     // Senha da rede Wi-Fi
 // ── Zona morta do analógico (evita drift em repouso) ──────────
 // Bluepad32 retorna -512 a +511 para os eixos analógicos
 #define DEADZONE  40
+
+// Zona morta dos gatilhos LT/RT (Bluepad32 retorna 0 a 1023)
+#define TRIGGER_DEADZONE  30
 
 // ── Micro Servo ───────────────────────────────────────────────
 #define SERVO_PIN        14    // Sinal do servo (GPIO liberto do ENA)
@@ -160,6 +164,21 @@ GamepadPtr gGamepad = nullptr;
 // ─────────────────────────────────────────────────────────────
 
 WebServer server(80);
+
+// Protótipos explícitos: impedem o pré-processador do Arduino de tentar
+// inseri-los dentro da string raw que contém a página HTML/JavaScript.
+void onConnectedGamepad(GamepadPtr gp);
+void onDisconnectedGamepad(GamepadPtr gp);
+void atualizarIMU();
+float adcParaPorcentagem(int adcVal);
+void capturarInclinacao();
+void controlarMotor(uint8_t pinIn1, uint8_t pinIn2, int valorEixo);
+void pararMotores();
+void handleRoot();
+void handleDados();
+void handleNotFound();
+void setup();
+void loop();
 
 // ─────────────────────────────────────────────────────────────
 //  HTML da Dashboard (armazenado na Flash via PROGMEM)
@@ -612,7 +631,8 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <footer>
   Calango-Tech &nbsp;|&nbsp; ESP32 DevKit V1 &nbsp;|&nbsp;
   Atualização automática a cada <span>1 s</span> &nbsp;|&nbsp;
-  Servidor rodando na porta <span>80</span>
+  Servidor rodando na porta <span>80</span> &nbsp;|&nbsp;
+  Versão <span>2026.07.10-3</span>
 </footer>
 
 <script>
@@ -622,8 +642,12 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   const pitchData = Array(MAX_PONTOS).fill(null);
   const rollData  = Array(MAX_PONTOS).fill(null);
 
-  const ctx = document.getElementById('imu-chart').getContext('2d');
-  const chart = new Chart(ctx, {
+  // O dashboard deve continuar atualizando mesmo sem acesso ao CDN do Chart.js.
+  // Isso e comum quando o navegador esta conectado diretamente a rede do ESP32.
+  let chart = null;
+  if (typeof Chart !== 'undefined') {
+    const ctx = document.getElementById('imu-chart').getContext('2d');
+    chart = new Chart(ctx, {
     type: 'line',
     data: {
       labels,
@@ -668,7 +692,10 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
         }
       }
     }
-  });
+    });
+  } else {
+    console.warn('Chart.js indisponivel; dados numericos continuam ativos.');
+  }
 
   // ── Funções de atualização da UI ──
 
@@ -680,24 +707,24 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
    * @param {number} minGrau — mínimo esperado (ex: -90)
    * @param {number} maxGrau — máximo esperado (ex: +90)
    */
-  function atualizarGauge(fillId, valId, graus, minGrau, maxGrau) {
+  const atualizarGauge = (fillId, valId, graus, minGrau, maxGrau) => {
     const totalArc = 251.2;                             // comprimento do semi-arco SVG
     const pct = (graus - minGrau) / (maxGrau - minGrau);
     const offset = totalArc * (1 - Math.min(Math.max(pct, 0), 1));
     document.getElementById(fillId).style.strokeDashoffset = offset.toFixed(1);
     document.getElementById(valId).textContent = graus.toFixed(1) + '°';
-  }
+  };
 
-  function atualizarServoBraco(graus) {
+  const atualizarServoBraco = (graus) => {
     // O braço parte de -90° (visual) e vai até +90°
     // Mapeamos 0° → -90deg CSS e 90° → +90deg CSS (meia volta)
     const cssRot = (graus / 90) * 90 - 90;
     document.getElementById('servo-arm').style.transform = `rotate(${cssRot}deg)`;
     document.getElementById('servo-angle').textContent = graus + '°';
     document.getElementById('servo-state').textContent = graus === 0 ? 'Repouso' : 'Medição';
-  }
+  };
 
-  function atualizarGamepad(conectado) {
+  const atualizarGamepad = (conectado) => {
     const icon = document.getElementById('gamepad-icon');
     const text = document.getElementById('gamepad-text');
     if (conectado) {
@@ -709,12 +736,13 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       text.className = 'gamepad-text offline';
       text.textContent = 'Desconectado';
     }
-  }
+  };
 
   // ── Polling ──
-  async function buscarDados() {
+  const buscarDados = async () => {
     try {
-      const resp = await fetch('/dados');
+      // Query unica + no-store evitam que o navegador reutilize um JSON antigo.
+      const resp = await fetch('/dados?t=' + Date.now(), { cache: 'no-store' });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const d = await resp.json();
 
@@ -739,9 +767,11 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       atualizarGamepad(d.gamepad);
 
       // Histórico gráfico
-      pitchData.shift(); pitchData.push(d.pitch);
-      rollData.shift();  rollData.push(d.roll);
-      chart.update('none');
+      if (chart) {
+        pitchData.shift(); pitchData.push(d.pitch);
+        rollData.shift();  rollData.push(d.roll);
+        chart.update('none');
+      }
 
       // Última coleta (botão A)
       if (d.tem_leitura_salva) {
@@ -756,7 +786,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('status-text').textContent = 'Sem sinal';
       console.warn('Erro ao buscar dados:', e.message);
     }
-  }
+  };
 
   buscarDados();
   setInterval(buscarDados, 1000);
@@ -915,6 +945,7 @@ void pararMotores() {
  * Serve a página HTML da dashboard.
  */
 void handleRoot() {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     server.send_P(200, "text/html", DASHBOARD_HTML);
 }
 
@@ -942,13 +973,18 @@ void handleDados() {
     float umidadePct  = adcParaPorcentagem(umidadeAoVivo);
 
     String json = "{";
+    json += "\"versao\":\""          + String(FIRMWARE_VERSION) + "\",";
     json += "\"pitch\":"           + String(gPitch, 2)         + ",";
     json += "\"roll\":"            + String(gRoll, 2)          + ",";
     json += "\"umidade_adc\":"     + String(umidadeAoVivo)     + ",";
     json += "\"umidade_pct\":"     + String(umidadePct, 1)     + ",";
     json += "\"servo_graus\":"     + String(gServoPosicao)     + ",";
-    json += "\"gamepad\":"         + (gGamepad ? "true" : "false") + ",";
-    json += "\"tem_leitura_salva\":" + (gTemLeituraSalva ? "true" : "false") + ",";
+    json += "\"gamepad\":";
+    json += (gGamepad != nullptr ? "true" : "false");
+    json += ",";
+    json += "\"tem_leitura_salva\":";
+    json += (gTemLeituraSalva ? "true" : "false");
+    json += ",";
     json += "\"pitch_salvo\":"     + String(gPitchSalvo, 2)    + ",";
     json += "\"roll_salvo\":"      + String(gRollSalvo, 2)     + ",";
     json += "\"umidade_adc_salvo\":" + String(gUmidadeADC)     + ",";
@@ -956,6 +992,7 @@ void handleDados() {
     json += "}";
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     server.send(200, "application/json", json);
 }
 
@@ -1072,12 +1109,29 @@ void loop() {
 
     if (gGamepad && gGamepad->isConnected()) {
 
-        // ── Leitura dos analógicos ────────────────────────────
-        // axisY()  → analógico esquerdo Y (-512 = cima, +511 = baixo)
-        // axisRY() → analógico direito  Y
-        // Invertemos o sinal: empurrar para cima = valor positivo = frente
-        int motorEsquerdo = -(gGamepad->axisY());
-        int motorDireito  = -(gGamepad->axisRY());
+        // RT (throttle) avança e LT (brake) dá ré.
+        // Quando nenhum gatilho está pressionado, mantém o controle tank
+        // pelos dois analógicos como alternativa.
+        int rt = gGamepad->throttle();
+        int lt = gGamepad->brake();
+        int motorEsquerdo;
+        int motorDireito;
+
+        if (rt > TRIGGER_DEADZONE || lt > TRIGGER_DEADZONE) {
+            int diferenca = rt - lt;
+
+            // Se RT e LT estiverem pressionados com força semelhante, para.
+            int comando = abs(diferenca) <= TRIGGER_DEADZONE
+                         ? 0
+                         : (diferenca > 0 ? 512 : -512);
+            motorEsquerdo = comando;
+            motorDireito  = comando;
+        } else {
+            // Tank drive: analógico esquerdo controla o motor esquerdo e
+            // analógico direito controla o motor direito.
+            motorEsquerdo = -(gGamepad->axisY());
+            motorDireito  = -(gGamepad->axisRY());
+        }
 
         // ── Botão A → captura e imprime inclinação ────────────
         // Detecção de borda de subida: só dispara uma vez por pressão
